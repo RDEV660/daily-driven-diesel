@@ -186,89 +186,160 @@ const soundBtn = $('#soundBtn');
 const ARC = 209.4; // 240deg of r=50 circumference
 const MAX_PSI = 45;
 
-// ---------- Turbo audio (WebAudio, only after user gesture) ----------
+// ---------- Turbo audio (WebAudio, mobile-safe unlock + phone-speaker harmonics) ----------
 let audio = null;
 let soundOn = true;
+
+function unlockMobileAudioSession() {
+  if (navigator.audioSession) {
+    try { navigator.audioSession.type = 'playback'; } catch (_) { /* noop */ }
+  }
+}
+
 function createAudio() {
+  unlockMobileAudioSession();
   const Ctx = window.AudioContext || window.webkitAudioContext;
   if (!Ctx) return null;
   const ctx = new Ctx();
-  const master = ctx.createGain(); master.gain.value = 0;
+  const master = ctx.createGain();
+  master.gain.value = 0.0001;
   const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -14;
+  comp.knee.value = 18;
+  comp.ratio.value = 4;
   master.connect(comp).connect(ctx.destination);
 
-  // turbo whistle (two partials)
-  const w1 = ctx.createOscillator(); w1.type = 'sine'; w1.frequency.value = 900;
-  const w2 = ctx.createOscillator(); w2.type = 'triangle'; w2.frequency.value = 1350;
-  const wG = ctx.createGain(); wG.gain.value = 0;
-  const w2G = ctx.createGain(); w2G.gain.value = 0.35;
+  // turbo compressor whine (fundamental + harmonic partial, audible on mobile speakers)
+  const w1 = ctx.createOscillator(); w1.type = 'sine'; w1.frequency.value = 650;
+  const w2 = ctx.createOscillator(); w2.type = 'triangle'; w2.frequency.value = 1300;
+  const wG = ctx.createGain(); wG.gain.value = 0.0001;
+  const w2G = ctx.createGain(); w2G.gain.value = 0.45;
   w1.connect(wG); w2.connect(w2G).connect(wG); wG.connect(master);
 
-  // air rush
+  // pressurized boost air rush
   const len = ctx.sampleRate * 2;
   const buf = ctx.createBuffer(1, len, ctx.sampleRate);
   const d = buf.getChannelData(0);
   for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
   const noise = ctx.createBufferSource(); noise.buffer = buf; noise.loop = true;
-  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.9;
-  const nG = ctx.createGain(); nG.gain.value = 0;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 800; bp.Q.value = 1.1;
+  const nG = ctx.createGain(); nG.gain.value = 0.0001;
   noise.connect(bp).connect(nG).connect(master);
 
-  // diesel rumble with clatter
-  const rum = ctx.createOscillator(); rum.type = 'sawtooth'; rum.frequency.value = 34;
-  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220;
-  const rG = ctx.createGain(); rG.gain.value = 0.3;
-  const lfo = ctx.createOscillator(); lfo.type = 'square'; lfo.frequency.value = 11;
+  // diesel exhaust growl (fundamental + 2nd harmonic so mobile speakers reproduce it clearly)
+  const rum = ctx.createOscillator(); rum.type = 'sawtooth'; rum.frequency.value = 58;
+  const rum2 = ctx.createOscillator(); rum2.type = 'sawtooth'; rum2.frequency.value = 116;
+  const rum2G = ctx.createGain(); rum2G.gain.value = 0.7;
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 340;
+  const rG = ctx.createGain(); rG.gain.value = 0.28;
+  const lfo = ctx.createOscillator(); lfo.type = 'square'; lfo.frequency.value = 12;
   const lfoG = ctx.createGain(); lfoG.gain.value = 0.12;
   lfo.connect(lfoG).connect(rG.gain);
-  rum.connect(lp).connect(rG).connect(master);
+  rum.connect(lp);
+  rum2.connect(rum2G).connect(lp);
+  lp.connect(rG).connect(master);
 
-  [w1, w2, noise, rum, lfo].forEach((n) => n.start());
-  return { ctx, master, w1, w2, wG, bp, nG, rum, lp, lfo, rG };
+  [w1, w2, noise, rum, rum2, lfo].forEach((n) => n.start());
+  return { ctx, master, w1, w2, wG, bp, nG, rum, rum2, lp, lfo, rG, buf };
 }
+
+function ensureAudioRunning() {
+  unlockMobileAudioSession();
+  if (!audio) audio = createAudio();
+  if (!audio) return;
+  const { ctx } = audio;
+  if (ctx.state !== 'running') {
+    try { ctx.resume(); } catch (_) { /* noop */ }
+  }
+  // iOS WebKit silent buffer warm-up inside direct touch/click gesture
+  try {
+    const s = ctx.createBufferSource();
+    s.buffer = ctx.createBuffer(1, 1, 22050);
+    s.connect(ctx.destination);
+    s.start(0);
+  } catch (_) { /* noop */ }
+}
+
+function triggerFlutter(level) {
+  if (!audio || !soundOn || level < 0.2) return;
+  try {
+    const { ctx, buf } = audio;
+    const now = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const flt = ctx.createBiquadFilter();
+    flt.type = 'bandpass';
+    flt.frequency.setValueAtTime(1600, now);
+    flt.frequency.exponentialRampToValueAtTime(650, now + 0.45);
+    flt.Q.value = 3.2;
+    const g = ctx.createGain();
+    const amp = Math.min(0.35, level * 0.35);
+    g.gain.setValueAtTime(0.001, now);
+    // turbo compressor surge / flutter pulses on throttle lift
+    for (let i = 0; i < 4; i++) {
+      const t = now + i * 0.085;
+      const pk = amp * Math.pow(0.68, i);
+      g.gain.linearRampToValueAtTime(pk, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.008, t + 0.08);
+    }
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+    src.connect(flt).connect(g).connect(ctx.destination);
+    src.start(now);
+    src.stop(now + 0.45);
+  } catch (_) { /* noop */ }
+}
+
 function updateAudio(spool, held) {
   if (!audio) return;
   const { ctx } = audio;
   const now = ctx.currentTime;
   const active = soundOn && (held || spool > 0.015);
-  audio.master.gain.setTargetAtTime(active ? 0.55 : 0, now, active ? 0.08 : 0.25);
-  audio.w1.frequency.setTargetAtTime(700 + spool * 5600, now, 0.05);
-  audio.w2.frequency.setTargetAtTime(1050 + spool * 8400, now, 0.05);
-  audio.wG.gain.setTargetAtTime(0.015 + spool * spool * 0.07, now, 0.05);
-  audio.bp.frequency.setTargetAtTime(500 + spool * 3200, now, 0.05);
-  audio.nG.gain.setTargetAtTime(0.02 + spool * 0.16, now, 0.05);
-  audio.rum.frequency.setTargetAtTime(34 + spool * 34, now, 0.08);
-  audio.lp.frequency.setTargetAtTime(220 + spool * 380, now, 0.08);
-  audio.lfo.frequency.setTargetAtTime(11 + spool * 22, now, 0.08);
+  audio.master.gain.setTargetAtTime(active ? 0.85 : 0.0001, now, active ? 0.04 : 0.18);
+  audio.w1.frequency.setTargetAtTime(580 + spool * 3200, now, 0.05);
+  audio.w2.frequency.setTargetAtTime(1160 + spool * 6400, now, 0.05);
+  audio.wG.gain.setTargetAtTime(0.06 + spool * 0.22, now, 0.05);
+  audio.bp.frequency.setTargetAtTime(600 + spool * 2600, now, 0.05);
+  audio.nG.gain.setTargetAtTime(0.05 + spool * 0.28, now, 0.05);
+  audio.rum.frequency.setTargetAtTime(58 + spool * 52, now, 0.07);
+  audio.rum2.frequency.setTargetAtTime(116 + spool * 104, now, 0.07);
+  audio.lp.frequency.setTargetAtTime(340 + spool * 620, now, 0.07);
+  audio.lfo.frequency.setTargetAtTime(12 + spool * 24, now, 0.07);
 }
 
+// Unlock AudioContext on first user interaction anywhere on mobile
+['touchstart', 'touchend', 'click'].forEach((ev) => {
+  window.addEventListener(ev, () => {
+    if (soundOn && audio && audio.ctx.state !== 'running') ensureAudioRunning();
+  }, { passive: true });
+});
+
 let held = false;
-function press(e) {
-  e.preventDefault();
+function press() {
+  if (soundOn) ensureAudioRunning();
+  if (held) return;
   held = true;
   state.boostTarget = 1;
   spoolBtn.classList.add('is-held');
-  if (spoolBtn.setPointerCapture && e.pointerId != null) { try { spoolBtn.setPointerCapture(e.pointerId); } catch (_) { /* noop */ } }
-  if (soundOn) {
-    if (!audio) audio = createAudio();
-    if (audio && audio.ctx.state === 'suspended') audio.ctx.resume();
-  }
-  if (navigator.vibrate) navigator.vibrate(15);
+  if (navigator.vibrate) { try { navigator.vibrate(15); } catch (_) { /* noop */ } }
 }
 function release() {
   if (!held) return;
   held = false;
+  triggerFlutter(state.spool);
   state.boostTarget = 0;
   spoolBtn.classList.remove('is-held');
 }
-spoolBtn.addEventListener('pointerdown', press);
-['pointerup', 'pointercancel', 'lostpointercapture'].forEach((ev) => spoolBtn.addEventListener(ev, release));
+spoolBtn.addEventListener('touchstart', () => press(), { passive: true });
+spoolBtn.addEventListener('mousedown', (e) => { if (e.button === 0) press(); });
+spoolBtn.addEventListener('pointerdown', (e) => { if (e.button === 0 || e.pointerType === 'touch') press(); });
+['touchend', 'touchcancel', 'mouseup', 'pointerup', 'pointercancel'].forEach((ev) => window.addEventListener(ev, release, { passive: true }));
 spoolBtn.addEventListener('contextmenu', (e) => e.preventDefault());
-spoolBtn.addEventListener('keydown', (e) => { if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) press(e); });
+spoolBtn.addEventListener('keydown', (e) => { if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) { e.preventDefault(); press(); } });
 spoolBtn.addEventListener('keyup', (e) => { if (e.key === ' ' || e.key === 'Enter') release(); });
 soundBtn.addEventListener('click', () => {
   soundOn = !soundOn;
   soundBtn.setAttribute('aria-pressed', String(soundOn));
+  if (soundOn) ensureAudioRunning();
 });
 
 // ---------- UI frame loop ----------
